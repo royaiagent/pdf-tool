@@ -5,8 +5,10 @@ from pptx.util import Pt
 from pptx.dml.color import RGBColor
 import io
 
-# --- 核心逻辑 ---
+# --- 核心逻辑 (保持不变) ---
 def convert_pdf_to_ppt(uploaded_file, conversion_mode, dpi, use_bg_fill):
+    # 重置文件指针，确保从头读取
+    uploaded_file.seek(0)
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
     prs = Presentation()
     first_page = doc[0]
@@ -63,12 +65,18 @@ def convert_pdf_to_ppt(uploaded_file, conversion_mode, dpi, use_bg_fill):
     output.seek(0)
     return output
 
-# --- 页面 UI ---
+# --- 页面 UI (修复了下载逻辑) ---
 st.set_page_config(page_title="PDF 转 PPT 工具", layout="wide")
 st.title("📄 超级 PDF 转 PPT 工具")
-st.markdown("不用懂代码，上传 PDF 直接转。支持**纯图模式**（完美还原）和**混合模式**（可编辑文字）。")
+
+# 初始化 session state 用于存储转换结果
+if 'ppt_data' not in st.session_state:
+    st.session_state['ppt_data'] = None
+if 'file_name' not in st.session_state:
+    st.session_state['file_name'] = "converted.pptx"
 
 col1, col2 = st.columns([1, 2])
+
 with col1:
     st.info("设置区域")
     mode = st.radio("选择模式", ["纯图演示模式 (Visual)", "混合编辑模式 (Hybrid)"])
@@ -78,12 +86,30 @@ with col1:
         use_bg = st.checkbox("文字加白底 (防重影)", value=True)
 
 with col2:
-    file = st.file_uploader("请把 PDF 拖进来", type=["pdf"])
-    if file:
-        if st.button("开始转换", type="primary"):
+    uploaded_file = st.file_uploader("请把 PDF 拖进来", type=["pdf"])
+    
+    if uploaded_file:
+        # 只要用户点击了转换，就把结果存到 session_state 里
+        if st.button("🚀 开始转换", type="primary"):
             try:
-                ppt = convert_pdf_to_ppt(file, mode, dpi, use_bg)
-                st.success("成功了！点击下方按钮下载 👇")
-                st.download_button("下载 PPT", ppt, "converted.pptx")
+                with st.spinner("正在施展魔法..."):
+                    # 执行转换
+                    ppt_io = convert_pdf_to_ppt(uploaded_file, mode, dpi, use_bg)
+                    
+                    # 存入状态
+                    st.session_state['ppt_data'] = ppt_io
+                    st.session_state['file_name'] = f"{uploaded_file.name.split('.')[0]}_converted.pptx"
+                    
+                st.success("🎉 转换成功！请点击下方按钮下载")
             except Exception as e:
                 st.error(f"出错啦: {e}")
+
+    # 下载按钮单独拿出来，放在 if st.button 外面
+    # 这样即使页面刷新，只要 session_state 里有数据，按钮依然有效
+    if st.session_state['ppt_data'] is not None:
+        st.download_button(
+            label="⬇️ 点击下载 PPT",
+            data=st.session_state['ppt_data'],
+            file_name=st.session_state['file_name'],
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        )
