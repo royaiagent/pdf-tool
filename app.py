@@ -3,21 +3,50 @@ import fitz  # PyMuPDF
 from pptx import Presentation
 from pptx.util import Pt
 from pptx.dml.color import RGBColor
+from pptx.oxml.ns import qn  # 用于注入XML命名空间
 import io
 
-# --- 核心逻辑 ---
-def convert_pdf_to_ppt(uploaded_file, conversion_mode, dpi, use_bg_fill):
-    # 重置文件指针
+# --- 字体强制修正函数 (核心黑科技) ---
+def set_font_style(run, font_size, font_color_int):
+    """
+    强制设置字体为微软雅黑，并保留字号和颜色
+    """
+    # 1. 设置字号
+    run.font.size = Pt(font_size)
+    
+    # 2. 设置字体名称 (常规设置)
+    run.font.name = "Microsoft YaHei"
+    
+    # 3. 设置中文字体 (底层XML注入，解决PPT不认中文字体的问题)
+    # 这一步非常关键，没有它，中文字体往往不会变
+    rPr = run.font._element.get_or_add_rPr()
+    ea = rPr.get_or_add_ea()
+    ea.set(qn('w:eastAsia'), 'Microsoft YaHei')
+    
+    # 4. 设置颜色
+    try:
+        # PyMuPDF的颜色有时是整数，有时是列表，做个容错
+        if isinstance(font_color_int, int):
+            run.font.color.rgb = RGBColor(
+                (font_color_int >> 16) & 0xFF, 
+                (font_color_int >> 8) & 0xFF, 
+                font_color_int & 0xFF
+            )
+        else:
+            run.font.color.rgb = RGBColor(0, 0, 0)
+    except:
+        run.font.color.rgb = RGBColor(0, 0, 0)
+
+# --- 核心转换逻辑 ---
+def convert_pdf_to_ppt(uploaded_file, include_bg_image):
     uploaded_file.seek(0)
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
     prs = Presentation()
     
     # 获取尺寸
     first_page = doc[0]
-    width = Pt(first_page.rect.width)
-    height = Pt(first_page.rect.height)
-    prs.slide_width = width
-    prs.slide_height = height
+    prs.slide_width = Pt(first_page.rect.width)
+    prs.slide_height = Pt(first_page.rect.height)
 
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -25,112 +54,71 @@ def convert_pdf_to_ppt(uploaded_file, conversion_mode, dpi, use_bg_fill):
 
     for i, page in enumerate(doc):
         progress_bar.progress((i + 1) / total_pages)
-        status_text.text(f"正在处理第 {i+1} / {total_pages} 页...")
+        status_text.text(f"正在清洗并重构第 {i+1} / {total_pages} 页文字...")
         
-        slide = prs.slides.add_slide(prs.slide_layouts[6]) # 空白页
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
 
-        # ==========================================
-        # 模式 A: 纯图模式 (Visual)
-        # ==========================================
-        if conversion_mode == "🖼️ 纯图演示模式 (Visual)":
-            pix = page.get_pixmap(dpi=dpi)
+        # --- 选项：是否保留背景图 ---
+        # 如果你只想要纯净的文字版，可以在网页上不勾选这个
+        if include_bg_image:
+            pix = page.get_pixmap(dpi=150)
             img_bytes = pix.tobytes("png")
-            slide.shapes.add_picture(io.BytesIO(img_bytes), 0, 0, width=width, height=height)
+            # 放入图片作为底层
+            slide.shapes.add_picture(io.BytesIO(img_bytes), 0, 0, width=prs.slide_width, height=prs.slide_height)
 
-        # ==========================================
-        # 模式 B: 混合模式 (Hybrid) - 背景图 + 文字
-        # ==========================================
-        elif conversion_mode == "🛡️ 混合编辑模式 (Hybrid)":
-            # 1. 先放背景图
-            pix = page.get_pixmap(dpi=dpi)
-            img_bytes = pix.tobytes("png")
-            slide.shapes.add_picture(io.BytesIO(img_bytes), 0, 0, width=width, height=height)
-            
-            # 2. 再放文字
-            extract_text_to_slide(page, slide, use_bg_fill)
+        # --- 核心：文字完美分离与重构 ---
+        # 使用 "dict" 模式获取最详细的排版信息
+        text_data = page.get_text("dict", flags=fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE)
+        
+        for block in text_data["blocks"]:
+            if block["type"] == 0:  # 0 = 文本
+                for line in block["lines"]:
+                    # 这里我们以“行”为单位创建文本框，保证位置最准
+                    # 如果以 block 为单位，段落间距容易乱
+                    
+                    line_text = ""
+                    # 预先计算这一行的边界
+                    x0, y0, x1, y1 = line["bbox"]
+                    
+                    # 创建文本框
+                    width = x1 - x0
+                    height = y1 - y0
+                    if width <= 0: width = 10
+                    if height <= 0: height = 10
+                    
+                    txBox = slide.shapes.add_textbox(Pt(x0), Pt(y0), Pt(width), Pt(height))
+                    tf = txBox.text_frame
+                    tf.word_wrap = False # 禁止自动换行，因为我们是按行提取的
+                    
+                    p = tf.paragraphs[0]
+                    
+                    # 遍历行内的每一个片段(span)
+                    for span in line["spans"]:
+                        text = span["text"]
+                        if not text.strip(): continue
+                        
+                        run = p.add_run()
+                        run.text = text
+                        
+                        # 调用上面的黑科技函数，强制微软雅黑
+                        set_font_style(run, span["size"], span["color"])
+                        
+                    # 视觉优化：如果是混合模式，给文本框加个半透明白底，避免和背景混在一起看不清
+                    # 但你要求“完美分离”，通常意味着背景要是白的。
+                    # 这里我做一个智能判断：如果有背景图，就加个白底；如果是纯白背景，就不加。
+                    if include_bg_image:
+                        txBox.fill.solid()
+                        txBox.fill.fore_color.rgb = RGBColor(255, 255, 255)
+                        # txBox.fill.transparency = 0.1 # 微微透一点，融合更好（可选）
 
-        # ==========================================
-        # 模式 C: 深度拆解模式 (Deconstructed) - 你的新需求
-        # ==========================================
-        elif conversion_mode == "🧩 深度拆解模式 (Editable Objects)":
-            # 1. 提取并放置所有独立图片 (Images)
-            # 获取页面上所有图片的信息
-            image_list = page.get_images(full=True)
-            
-            for img_index, img in enumerate(image_list):
-                xref = img[0]
-                # 提取图片字节流
-                base_image = doc.extract_image(xref)
-                image_bytes = base_image["image"]
-                
-                # 获取图片在页面上的坐标 (Rect)
-                # 注意：一张图可能在页面上出现多次，get_image_rects 返回列表
-                img_rects = page.get_image_rects(xref)
-                
-                for rect in img_rects:
-                    # 只有当图片有大小时才插入
-                    if rect.width > 0 and rect.height > 0:
-                        try:
-                            slide.shapes.add_picture(
-                                io.BytesIO(image_bytes), 
-                                Pt(rect.x0), 
-                                Pt(rect.y0), 
-                                width=Pt(rect.width), 
-                                height=Pt(rect.height)
-                            )
-                        except:
-                            pass # 忽略无法处理的极小图片或错误图片
-
-            # 2. 提取并放置文字 (Text)
-            # 在拆解模式下，我们强制不加背景色，让文字背景透明
-            extract_text_to_slide(page, slide, use_bg_fill=False)
-
-    # 导出
     output = io.BytesIO()
     prs.save(output)
     output.seek(0)
     return output
 
-def extract_text_to_slide(page, slide, use_bg_fill):
-    """提取文字并添加到 PPT 幻灯片的通用函数"""
-    text_data = page.get_text("dict")
-    for block in text_data["blocks"]:
-        if block["type"] == 0: # 文本块
-            for line in block["lines"]:
-                for span in line["spans"]:
-                    text = span["text"].strip()
-                    if not text: continue
-                    
-                    x0, y0, x1, y1 = span["bbox"]
-                    w, h = x1 - x0, y1 - y0
-                    
-                    # 容错：如果宽高太小，稍微给一点默认值，防止PPT报错
-                    if w <= 0: w = 10
-                    if h <= 0: h = 10
-
-                    txBox = slide.shapes.add_textbox(Pt(x0), Pt(y0), Pt(w), Pt(h))
-                    tf = txBox.text_frame
-                    tf.word_wrap = True
-                    p = tf.paragraphs[0]
-                    run = p.add_run()
-                    run.text = text
-                    run.font.size = Pt(span["size"])
-                    
-                    # 颜色
-                    try:
-                        c = span["color"]
-                        run.font.color.rgb = RGBColor((c>>16)&0xFF, (c>>8)&0xFF, c&0xFF)
-                    except:
-                        run.font.color.rgb = RGBColor(0,0,0)
-
-                    # 只有混合模式才需要背景遮挡，拆解模式不需要
-                    if use_bg_fill:
-                        txBox.fill.solid()
-                        txBox.fill.fore_color.rgb = RGBColor(255, 255, 255)
-
 # --- 页面 UI ---
-st.set_page_config(page_title="PDF 转 PPT 专业版", layout="wide")
-st.title("📄 PDF 转 PPT：专业分层版")
+st.set_page_config(page_title="PDF 转 PPT (微软雅黑修正版)", layout="wide")
+st.title("📄 PDF 文字完美提取工具")
 
 if 'ppt_data' not in st.session_state:
     st.session_state['ppt_data'] = None
@@ -140,47 +128,30 @@ if 'file_name' not in st.session_state:
 col1, col2 = st.columns([1, 2])
 
 with col1:
-    st.info("模式选择")
-    mode = st.radio("请选择转换策略：", [
-        "🖼️ 纯图演示模式 (Visual)", 
-        "🛡️ 混合编辑模式 (Hybrid)", 
-        "🧩 深度拆解模式 (Editable Objects)"
-    ])
+    st.info("设置")
+    st.markdown("### 🔠 字体策略")
+    st.markdown("已强制启用 **Microsoft YaHei (微软雅黑)** 渲染引擎。所有提取的文字都将规范化为此字体，同时保持原有的字号大小。")
     
-    st.markdown("---")
-    
-    if mode == "🖼️ 纯图演示模式 (Visual)":
-        st.caption("也就是“截图转PPT”。100% 还原样子，但里面什么都不能改。")
-        dpi = st.slider("清晰度", 100, 300, 150)
-        use_bg = False
-        
-    elif mode == "🛡️ 混合编辑模式 (Hybrid)":
-        st.caption("背景是图片，文字覆盖在上面。**样子最还原，且文字可改**，但图片不能移动。")
-        dpi = st.slider("背景清晰度", 100, 300, 150)
-        use_bg = st.checkbox("文字加白底 (防止重影)", value=True)
-        
-    elif mode == "🧩 深度拆解模式 (Editable Objects)":
-        st.warning("⚠️ 注意：此模式会把图片和文字彻底分开。但复杂的背景装饰（如波浪、渐变色）可能会丢失，变成白底。")
-        dpi = 150 # 拆解模式不需要设置背景DPI
-        use_bg = False
+    st.markdown("### 🖼️ 背景策略")
+    include_bg = st.checkbox("保留原PDF背景图", value=False, help="如果不勾选，PPT背景将是纯白的，只有文字。勾选后，文字会覆盖在图片上（带白色底色）。")
 
 with col2:
-    uploaded_file = st.file_uploader("上传 PDF", type=["pdf"])
+    uploaded_file = st.file_uploader("上传 PDF 文件", type=["pdf"])
     
     if uploaded_file:
-        if st.button("🚀 开始转换", type="primary"):
+        if st.button("🚀 开始提取与转换", type="primary"):
             try:
-                with st.spinner("正在逐层拆解 PDF 元素..."):
-                    ppt_io = convert_pdf_to_ppt(uploaded_file, mode, dpi, use_bg)
+                with st.spinner("正在进行字体规范化处理..."):
+                    ppt_io = convert_pdf_to_ppt(uploaded_file, include_bg)
                     st.session_state['ppt_data'] = ppt_io
-                    st.session_state['file_name'] = f"{uploaded_file.name.split('.')[0]}_edited.pptx"
-                st.success("✅ 处理完成！")
+                    st.session_state['file_name'] = f"{uploaded_file.name.split('.')[0]}_yahei.pptx"
+                st.success("✅ 转换完成！文字已转为微软雅黑。")
             except Exception as e:
-                st.error(f"转换出错: {e}")
+                st.error(f"发生错误: {e}")
 
     if st.session_state['ppt_data'] is not None:
         st.download_button(
-            label="⬇️ 下载最终 PPT",
+            label="⬇️ 下载 PPT (微软雅黑版)",
             data=st.session_state['ppt_data'],
             file_name=st.session_state['file_name'],
             mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
